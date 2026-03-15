@@ -1,8 +1,16 @@
+from __future__ import annotations
 import praw
-from utils import praw_retry, SingletonSentenceTransformer, SingletonStaticModel
-from sentence_transformers import SentenceTransformer
+from utils import praw_retry
 import numpy as np
 
+from bs4 import BeautifulSoup
+
+import time
+import random
+
+import requests
+
+from airflow.models import Variable
 
 @praw_retry
 def post_type(post: praw.models.Comment | praw.models.Submission) -> str:
@@ -119,6 +127,11 @@ def subreddit_is18plus(subreddit: praw.models.Subreddit) -> bool:
 def subreddit_n_rules(subreddit: praw.models.Subreddit) -> int:
     return len(subreddit.rules()['rules'])
 
+
+@praw_retry
+def subreddit_rules(subreddit: praw.models.Subreddit):
+    return subreddit.rules()['rules']
+
 @praw_retry
 def subreddit_subscribers(subreddit: praw.models.Subreddit) -> int:
     return subreddit.subscribers
@@ -156,6 +169,29 @@ def user_mod_join_date(user: praw.models.Redditor) -> int:
 def user_subreddits_moderated(user: praw.models.Redditor) -> list:
     return [subreddit_name(sr) for sr in user.moderated()]
 
+@praw_retry
+def user_subreddits_moderated_info(user: praw.models.Redditor) -> list:
+    subreddits_info = []
+    for sr in user.moderated():
+        try:
+            subreddits_info.append({
+                "name": subreddit_name(sr),
+                "subscribers": subreddit_subscribers(sr),
+                "join_date": subreddit_moderator_join_date_utc(subreddit=sr, user=user),
+            })
+        except Exception:
+            continue
+
+    return subreddits_info
+
+@praw_retry
+def subreddit_moderator_join_date_utc(subreddit: praw.models.Subreddit, user: praw.models.Redditor) -> list:
+    return subreddit.moderator(redditor = user.name)[0].date
+
+@praw_retry
+def user_recent_comments(user: praw.models.Redditor, limit: int = 100) -> list:
+    comments = [post_body(comment) for comment in user.comments.new(limit=limit)]
+    return comments
 
 @praw_retry
 def user_name(user: praw.models.Redditor) -> str:
@@ -188,21 +224,41 @@ def user_created_unix(user: praw.models.Redditor | praw.models.Comment | praw.mo
         return user.author.created_utc
     return user.created_utc
 
-
 @praw_retry
-def user_average_comment_embedding(user: praw.models.Redditor, limit: int = 100,
-                                   model_name: str = 'minishlab/potion-base-2M') -> list:
-    comments = user.comments.new(limit=limit)
-    sentences = []
-    for comment in comments:
-        sentences.append(post_body(comment))
+def engagement_metrics(subreddit: praw.models.Subreddit):
+    time.sleep(1 + random.random() * 2)
+    cookies = {
+        'reddit_session': Variable.get("REDDIT_SESSION"),
+    }
 
-    if len(sentences) == 0:
-        return []
+    headers = {
+        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'accept-language': 'en-US,en;q=0.7',
+        'cache-control': 'max-age=0',
+        'priority': 'u=0, i',
+        'sec-ch-ua': '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
+        'sec-ch-ua-mobile': '?1',
+        'sec-ch-ua-platform': '"Android"',
+        'sec-fetch-dest': 'document',
+        'sec-fetch-mode': 'navigate',
+        'sec-fetch-site': 'none',
+        'sec-fetch-user': '?1',
+        'sec-gpc': '1',
+        'upgrade-insecure-requests': '1',
+        'user-agent': 'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Mobile Safari/537.36'
+        }
 
-    #model = SingletonSentenceTransformer(model_name).model
-    model = SingletonSentenceTransformer(model_name).model
+    response = requests.get(f'https://www.reddit.com/r/{subreddit.display_name}/', cookies=cookies, headers=headers)
 
-    embeddings = model.encode(sentences)
+    html = response.text
+    soup = BeautifulSoup(html, "html.parser")
 
-    return np.mean(embeddings, axis=0).tolist()
+    header = soup.find("shreddit-subreddit-header")
+
+    if header:
+        wau = header.get("weekly-active-users")
+        contributions = header.get("weekly-contributions")
+
+        return {"weekly_active_users": wau, "weekly_contributions": contributions}
+    else:
+        return {"weekly_active_users": None, "weekly_contributions": None}
