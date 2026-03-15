@@ -1,14 +1,22 @@
+from __future__ import annotations
+
 import inspect
 import itertools
-import logging
+import os
 
 from airflow import DAG
-from airflow.operators.python_operator import PythonOperator
+try:
+    # Airflow >= 2.0
+    from airflow.operators.python import PythonOperator
+except ImportError:
+    from airflow.operators.python_operator import PythonOperator
+
 from datetime import datetime, timedelta, timezone
 import praw
 from prawcore.exceptions import NotFound, Forbidden, Redirect
 from tqdm import tqdm
 import json
+import logging
 
 from pymongo import MongoClient
 
@@ -23,6 +31,29 @@ import sampling_methods
 
 DATA_ROOT = Path(__file__).resolve().parent.parent
 
+def get_mongo_client() -> MongoClient:
+    from airflow.sdk import Variable
+
+    def get_var(key, default=""):
+        val = Variable.get(key, default=None)
+        if val is not None:
+            return val
+        return os.environ.get(key, default)
+
+    host     = get_var("MONGO_HOST",     "localhost")
+    port     = int(get_var("MONGO_PORT", "27017"))
+    user     = get_var("MONGO_USER",     "")
+    password = get_var("MONGO_PASSWORD", "")
+    db_name  = get_var("MONGO_DB",       "ContentModerationDB")
+    auth_src = get_var("MONGO_AUTH_SRC", "admin")
+
+    if user and password:
+        uri = f"mongodb://{user}:{password}@{host}:{port}/{db_name}?authSource={auth_src}"
+    else:
+        uri = f"mongodb://{host}:{port}/{db_name}"
+
+    return MongoClient(uri)
+
 default_args = {
     'owner': 'airflow',
     'depends_on_past': False,
@@ -31,7 +62,6 @@ default_args = {
     'retries': 5,
     'retry_delay': timedelta(minutes=1),
 }
-
 
 def sample_task(**kwargs):
     """
@@ -55,17 +85,15 @@ def sample_task(**kwargs):
     else:
         raise NotImplementedError(f"Unknown sample_strategy: {kwargs['config']['sample_strategy']}")
 
-
 def stream_task(**kwargs):
-    """
-    The stream task ingests new posts from either praw RedditorStream or SubredditStream objects (dep. on stream_type).
-    """
-    client = MongoClient("mongodb://localhost:27017/")
+    client = get_mongo_client()
     db = client["ContentModerationDB"]
 
-    kwargs['ti'].xcom_push(key='streaming_has_finished', value=False)
+    start_time = kwargs['ti'].xcom_pull(key='start_date')
 
-    start_time = datetime.now(timezone.utc)
+    if start_time is None:
+        start_time = datetime.now(timezone.utc)
+
     duration = timedelta(days=kwargs['config']['stream_duration_days'])
 
     reddit = utils.Reddit(client_info=kwargs['config']['client_info'])
@@ -107,15 +135,48 @@ def stream_task(**kwargs):
         except:  # User is suspended
             return submission_list
 
-    posts_today = {}
-    today = datetime.now(timezone.utc).date()
+
+    run_id = kwargs['run_id']
+
+    state_doc = db["stream_state"].find_one({"run_id": run_id})
+    if state_doc is None:
+        state_doc = {
+            "run_id": run_id,
+            "posts_today": {},
+            "streaming_has_finished": False,
+            "last_loop_duration_seconds": None,
+        }
+        db["stream_state"].insert_one(state_doc)
+
+    posts_today = state_doc["posts_today"]
+
+    start_date = kwargs['ti'].xcom_pull(key='start_date')
+
+    if start_date is None:
+        start_date = datetime.now(timezone.utc).date()
+
+    def _save_state(posts_today, finished, loop_duration_seconds=None):
+        db["stream_state"].update_one(
+            {"run_id": run_id},
+            {"$set": {
+                "posts_today": posts_today,
+                "streaming_has_finished": finished,
+                "last_loop_duration_seconds": loop_duration_seconds,
+                "updated_at": datetime.now(timezone.utc),
+            }}
+        )
 
     while datetime.now(timezone.utc) - start_time < duration:
-        post_count = 0
 
-        for k in tqdm(streams.keys()):
-            if (k not in posts_today.keys()) or (posts_today[k]["date"] != today):
-                posts_today[k] = {"date": today, "count": 0}
+        post_count = 0
+        today = datetime.now(timezone.utc).date()
+        today_str = today.isoformat()
+
+        loop_start = datetime.now(timezone.utc)
+        for k in streams.keys():
+            if (k not in posts_today.keys()) or (posts_today[k]["date"] != today_str):
+                posts_today[k] = {"date": today_str, "count": 0}
+                _save_state(posts_today, finished=False)
             if posts_today[k]["count"] >= kwargs['config']['max_posts_per_stream_per_day']:
                 continue
             try:
@@ -136,6 +197,8 @@ def stream_task(**kwargs):
                     total_posts = len(comments) + len(submissions)
 
                 posts_today[k]["count"] += total_posts
+                _save_state(posts_today, finished=False)
+
                 post_count += total_posts
                 for post in itertools.chain(comments, submissions):
 
@@ -166,9 +229,9 @@ def stream_task(**kwargs):
                         }
 
                         scrape_time = metrics.post_created_utc(post)
-                        if isinstance(scrape_time, int):
+                        if isinstance(scrape_time, (int, float)):
                             scrape_time = datetime.fromtimestamp(scrape_time, timezone.utc)
-                        else:  # scrape_time returned an error
+                        if isinstance(scrape_time, str):  # scrape_time returned an error
                             scrape_time = datetime.now(timezone.utc)
 
                         post_dynamic_entry["scrape_time"] = scrape_time
@@ -238,8 +301,12 @@ def stream_task(**kwargs):
 
             except (NotFound, Forbidden, Redirect):  # Stream source no longer good.
                 streams.remove(k)
+        
+        loop_end = datetime.now(timezone.utc)
+        loop_duration_seconds = (loop_end - loop_start).total_seconds()
+        _save_state(posts_today, finished=False, loop_duration_seconds=loop_duration_seconds)
 
-    kwargs['ti'].xcom_push(key='streaming_has_finished', value=True)
+    _save_state(posts_today, finished=True, loop_duration_seconds=loop_duration_seconds)
 
 
 @praw_retry
@@ -253,14 +320,21 @@ def get_submission(reddit, id):
 
 
 def monitor_task(**kwargs):
-    streaming_finished = kwargs['ti'].xcom_pull(task_ids='stream', key='streaming_has_finished')
     monitoring_finished = False
 
-    client = MongoClient("mongodb://localhost:27017/")
+    client = get_mongo_client()
 
     db = client["ContentModerationDB"]
 
-    while (not streaming_finished) or (not monitoring_finished):
+    run_id = kwargs['run_id']
+
+    while True:
+        state_doc = db["stream_state"].find_one({"run_id": run_id})
+        streaming_finished = state_doc.get("streaming_has_finished", False) if state_doc else False
+
+        if streaming_finished and monitoring_finished:
+            break
+
         reddit = utils.Reddit(client_info=kwargs['config']['client_info'])
 
         # Post Monitoring
@@ -268,7 +342,7 @@ def monitor_task(**kwargs):
             pipelines.monitorable_post_pipeline(kwargs['config']['n_monitors'],
                                                 kwargs['config']['monitor_interval_hours'])))
 
-        for monitorable_post in tqdm(monitorable_posts, desc=f"Monitoring {len(monitorable_posts)} posts."):
+        for monitorable_post in monitorable_posts:
             if monitorable_post['post_type'] == 'comment':
                 post = get_comment(reddit, monitorable_post['post_id'])
             elif monitorable_post['post_type'] == 'submission':
@@ -297,8 +371,7 @@ def monitor_task(**kwargs):
         if len(monitorable_subreddits) > 0:
             print(f"Found {len(monitorable_subreddits)} monitorable subreddits.")
 
-        for monitorable_subreddit in tqdm(monitorable_subreddits,
-                                          desc=f"Monitoring {len(monitorable_subreddits)} subreddits."):
+        for monitorable_subreddit in monitorable_subreddits:
             sr = utils.get_subreddit(reddit, monitorable_subreddit['subreddit_name'])
 
             subreddit_dynamic_entry = {
@@ -317,14 +390,14 @@ def monitor_task(**kwargs):
             )
 
         # Moderator Monitoring
-        monitorable_mods = list(db['posts_static'].aggregate(
-            pipelines.monitorable_mods_pipeline(kwargs['config']['n_monitors'],
+        monitorable_mods = list(db['moderators_dynamic'].aggregate(
+            pipelines.monitorable_mod_pipeline_simple(kwargs['config']['n_monitors'],
                                                 kwargs['config']['monitor_interval_hours'])))
 
         if len(monitorable_mods) > 0:
             print(f"Found {len(monitorable_mods)} monitorable moderators.")
 
-        for monitorable_mod in tqdm(monitorable_mods, desc=f"Monitoring {len(monitorable_mods)} moderators."):
+        for monitorable_mod in monitorable_mods:
             mod = utils.get_redditor(reddit, monitorable_mod['_id'])
 
             moderator_dynamic_entry = {
@@ -342,17 +415,13 @@ def monitor_task(**kwargs):
                 moderator_dynamic_entry
             )
 
-        if len(monitorable_posts) == 0:
-            monitoring_finished = True
-        else:
-            monitoring_finished = False
+        monitoring_finished = (len(monitorable_posts) == 0)
 
 
 with DAG(
         'content_moderation_data_collection',
         default_args=default_args,
         description='Sample usernames, stream posts, and monitor variables.',
-        schedule_interval=None,
         catchup=False,
 ) as dag:
     with open(DATA_ROOT / 'config.json', 'r') as f:
@@ -363,7 +432,6 @@ with DAG(
     sample_task_operator = PythonOperator(
         task_id='sample',
         python_callable=sample_task,
-        provide_context=True,
         op_kwargs={
             'config': config
         },
@@ -372,7 +440,6 @@ with DAG(
     stream_task_operator = PythonOperator(
         task_id='stream',
         python_callable=stream_task,
-        provide_context=True,
         op_kwargs={
             'config': config
         },
@@ -381,11 +448,9 @@ with DAG(
     monitor_task_operator = PythonOperator(
         task_id='monitor',
         python_callable=monitor_task,
-        provide_context=True,
         op_kwargs={
             'config': config
         },
     )
 
     sample_task_operator >> [stream_task_operator, monitor_task_operator]
-
